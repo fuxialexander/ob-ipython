@@ -374,16 +374,18 @@ a new kernel will be started."
   "Get jupyter client to inspect code, return JSON result."
   (let ((input (json-encode `((code . ,code)
                               (pos . ,(or pos (length code)))
-                              (detail . ,(or detail 0))))))
+                              (detail . ,(or detail 0)))))
+        (args (list "--" ob-ipython-client-path
+                    "--conn-file"
+                    (ob-ipython--get-session-from-edit-buffer (current-buffer))
+                    "--inspect"))
+        )
     (with-temp-buffer
       ;; this will call inspect on the jupyter_client with the whole code block and a pos
       ;; according to jupyter_client docs, you can send a whole cell or a single statement
       (let ((ret (apply 'call-process-region input nil
                         (ob-ipython--get-python) nil t nil
-                        (list "--" ob-ipython-client-path
-                              "--conn-file"
-                              (ob-ipython--get-session-from-edit-buffer (current-buffer))
-                              "--inspect"))))
+                        args)))
         (if (> ret 0)
             (ob-ipython--dump-error (buffer-string))
           (goto-char (point-min))
@@ -421,13 +423,15 @@ a new kernel will be started."
 
 (defun ob-ipython--complete-request (code &optional pos)
   (let ((input (json-encode `((code . ,code)
-                              (pos . ,(or pos (length code)))))))
+                              (pos . ,(or pos (length code))))))
+        (args (list "--" ob-ipython-client-path "--conn-file"
+                    (ob-ipython--get-session-from-edit-buffer (current-buffer))
+                    "--complete"))
+        )
     (with-temp-buffer
       (let ((ret (apply 'call-process-region input nil
                         (ob-ipython--get-python) nil t nil
-                        (list "--" ob-ipython-client-path "--conn-file"
-                              (ob-ipython--get-session-from-edit-buffer (current-buffer))
-                              "--complete"))))
+                        args)))
         (if (> ret 0)
             (ob-ipython--dump-error (buffer-string))
           (goto-char (point-min))
