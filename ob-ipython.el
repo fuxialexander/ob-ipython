@@ -175,7 +175,7 @@ can be displayed.")
              (not (s-ends-with-p ".json" name)))
     (ob-ipython--create-process
      (format "kernel-%s" name)
-     (append 
+     (append
       (list ob-ipython-command "console" "--simple-prompt")
       (list "-f" (ob-ipython--kernel-file name))
       (if kernel (list "--kernel" kernel) '())
@@ -213,14 +213,29 @@ can be displayed.")
         cdr
         list)))
 
-;;; TODO: broken
+;;; TODO: make this work on windows
+;;; NOTE: interrupting remote kernel not currently possible, cf https://github.com/jupyter/jupyter_console/issues/150
 (defun ob-ipython-interrupt-kernel (proc)
   "Interrupt a running kernel. Useful for terminating infinite
 loops etc. If things get really desparate try `ob-ipython-kill-kernel'."
   (interactive (ob-ipython--choose-kernel))
   (when proc
-    (interrupt-process proc)
-    (message (format "Interrupted %s" (process-name proc)))))
+    ;; send SIGINT to "python -m ipykernel_launcher", a child of proc
+    (let ((proc-name (process-name proc)))
+      (accept-process-output
+       ;; get the child pid with pgrep -P
+       ;; NOTE assumes proc has only 1 child (seems to be true always)
+       (make-process
+        :name (concat proc-name "-child")
+        :command (list "pgrep" "-P" (number-to-string
+                                     (process-id proc)))
+        ;; send SIGINT to child-proc
+        :filter
+        (lambda (proc child-proc-id)
+          (make-process
+           :name (concat "interrupt-" proc-name)
+           :command (list "kill" "-2"
+                          (string-trim child-proc-id)))))))))
 
 (defun ob-ipython-kill-kernel (proc)
   "Kill a kernel process. If you then re-evaluate a source block
@@ -361,10 +376,20 @@ a new kernel will be started."
        (assoc 'status)
        cdr))
 
+(defun ob-ipython--extract-execution-count (msgs)
+  (->> msgs
+       (-filter (lambda (msg) (-contains? '("execute_reply")
+                                          (cdr (assoc 'msg_type msg)))))
+       car
+       (assoc 'content)
+       (assoc 'execution_count)
+       cdr))
+
 (defun ob-ipython--eval (service-response)
   (let ((status (ob-ipython--extract-status service-response)))
     (cond ((string= "ok" status) `((:result . ,(ob-ipython--extract-result service-response))
-                                   (:output . ,(ob-ipython--extract-output service-response))))
+                                   (:output . ,(ob-ipython--extract-output service-response))
+                                   (:exec-count . ,(ob-ipython--extract-execution-count service-response))))
           ((string= "abort" status) (error "Kernel execution aborted."))
           ((string= "error" status) (error (ob-ipython--extract-error service-response))))))
 
@@ -373,23 +398,23 @@ a new kernel will be started."
 (defun ob-ipython--inspect-request (code &optional pos detail)
   (let ((input (json-encode `((code . ,code)
                               (pos . ,(or pos (length code)))
-                              (detail . ,(or detail 0))))))
+                              (detail . ,(or detail 0)))))
+        (args (list "--" ob-ipython-client-path
+                    "--conn-file"
+                    (ob-ipython--get-session-from-edit-buffer (current-buffer))
+                    "--inspect")))
     (with-temp-buffer
       (let ((ret (apply 'call-process-region input nil
                         (ob-ipython--get-python) nil t nil
-                        (list "--" ob-ipython-client-path
-                              "--conn-file"
-                              (ob-ipython--get-session-from-edit-buffer (current-buffer))
-                              "--inspect"))))
+                        args)))
         (if (> ret 0)
             (ob-ipython--dump-error (buffer-string))
           (goto-char (point-min))
           (ob-ipython--collect-json))))))
 
-(defun ob-ipython--inspect (buffer pos)
-  (let* ((code (with-current-buffer buffer
-                 (buffer-substring-no-properties (point-min) (point-max))))
-         (resp (ob-ipython--inspect-request code pos 0))
+(defun ob-ipython--inspect (code pos)
+  "Given a piece of code and a point position, return inspection results."
+  (let* ((resp (ob-ipython--inspect-request code pos 0))
          (status (ob-ipython--extract-status resp)))
     (if (string= "ok" status)
         (->> resp
@@ -406,21 +431,26 @@ a new kernel will be started."
 (defun ob-ipython-inspect (buffer pos)
   "Ask a kernel for documentation on the thing at POS in BUFFER."
   (interactive (list (current-buffer) (point)))
-  (-if-let (result (->> (ob-ipython--inspect buffer pos) (assoc 'text/plain) cdr))
-      (ob-ipython--create-inspect-buffer result)
-    (message "No documentation was found.")))
+  (let ((code (with-current-buffer buffer
+                (buffer-substring-no-properties (point-min) (point-max)))))
+    (-if-let (result (->> (ob-ipython--inspect code pos)
+                          (assoc 'text/plain)
+                          cdr))
+        (ob-ipython--create-inspect-buffer result)
+      (message "No documentation was found."))))
 
 ;; completion
 
 (defun ob-ipython--complete-request (code &optional pos)
   (let ((input (json-encode `((code . ,code)
-                              (pos . ,(or pos (length code)))))))
+                              (pos . ,(or pos (length code))))))
+        (args (list "--" ob-ipython-client-path "--conn-file"
+                    (ob-ipython--get-session-from-edit-buffer (current-buffer))
+                    "--complete")))
     (with-temp-buffer
       (let ((ret (apply 'call-process-region input nil
                         (ob-ipython--get-python) nil t nil
-                        (list "--" ob-ipython-client-path "--conn-file"
-                              (ob-ipython--get-session-from-edit-buffer (current-buffer))
-                              "--complete"))))
+                        args)))
         (if (> ret 0)
             (ob-ipython--dump-error (buffer-string))
           (goto-char (point-min))
@@ -443,18 +473,29 @@ a new kernel will be started."
                            (assoc 'content)
                            cdr)))))))
 
+(defun ob-ipython--company-doc-buffer (doc)
+  "Make company-suggested doc-buffer with ansi-color support."
+  (let ((buf (company-doc-buffer doc)))
+    (with-current-buffer buf
+      (ansi-color-apply-on-region (point-min) (point-max)))
+    buf))
+
 (defun company-ob-ipython (command &optional arg &rest ignored)
   (interactive (list 'interactive))
   (cl-case command
     (interactive (company-begin-backend 'company-ob-ipython))
-    (prefix (and
-             ob-ipython-mode
-             (let ((res (ob-ipython-completions (current-buffer) (1- (point)))))
-               (substring (buffer-string) (cdr (assoc 'cursor_start res))
-                          (cdr (assoc 'cursor_end res))))))
-    (candidates (let ((res (ob-ipython-completions (current-buffer) (1- (point)))))
-                  (cdr (assoc 'matches res))))
-    (sorted t)))
+    (prefix (and ob-ipython-mode
+                 (let ((res (ob-ipython-completions (current-buffer) (1- (point)))))
+                   (substring-no-properties (buffer-string)
+                                            (cdr (assoc 'cursor_start res))
+                                            (cdr (assoc 'cursor_end res))))))
+    (candidates (cons :async (lambda (cb)
+                               (let ((res (ob-ipython-completions
+                                           (current-buffer) (1- (point)))))
+                                 (funcall cb (cdr (assoc 'matches res)))))))
+    (sorted t)
+    (doc-buffer (ob-ipython--company-doc-buffer
+                 (cdr (assoc 'text/plain (ob-ipython--inspect arg (length arg))))))))
 
 ;; mode
 
@@ -521,7 +562,10 @@ have previously been configured."
 (defvar org-babel-default-header-args:ipython '())
 
 (defun org-babel-edit-prep:ipython (info)
-  ;; TODO: based on kernel, should change the mode
+  ;; TODO: based on kernel, should change the major mode
+  (ob-ipython--create-kernel (->> info (nth 2) (assoc :session) cdr
+                                  ob-ipython--normalize-session)
+                             (->> info (nth 2) (assoc :kernel) cdr))
   (ob-ipython-mode +1))
 
 (defun ob-ipython--normalize-session (session)
@@ -549,6 +593,7 @@ This function is called by `org-babel-execute-src-block'."
   (let* ((file (cdr (assoc :ipyfile params)))
          (session (cdr (assoc :session params)))
          (result-type (cdr (assoc :result-type params)))
+         (result-params (cdr (assoc :result-params params)))
          (sentinel (ipython--async-gen-sentinel)))
     (ob-ipython--create-kernel (ob-ipython--normalize-session session)
                                (cdr (assoc :kernel params)))
@@ -556,11 +601,12 @@ This function is called by `org-babel-execute-src-block'."
      (org-babel-expand-body:generic (encode-coding-string body 'utf-8)
                                     params (org-babel-variable-assignments:python params))
      (ob-ipython--normalize-session session)
-     (lambda (ret sentinel buffer file result-type)
-       (let ((replacement (ob-ipython--process-response ret file result-type)))
-         (ipython--async-replace-sentinel sentinel buffer replacement)))
-     (list sentinel (current-buffer) file result-type))
-    sentinel))
+     (lambda (ret sentinel buffer file result-type result-params)
+       (unless (member "silent" result-params)
+         (let ((replacement (ob-ipython--process-response ret file result-type)))
+           (ipython--async-replace-sentinel sentinel buffer replacement))))
+     (list sentinel (current-buffer) file result-type result-params))
+    (format "%s - %s" (length ob-ipython--async-queue) sentinel)))
 
 (defun ob-ipython--execute-sync (body params)
   (let* ((file (cdr (assoc :ipyfile params)))
@@ -581,10 +627,12 @@ This function is called by `org-babel-execute-src-block'."
     (if (eq result-type 'output)
         output
       (ob-ipython--output output nil)
-      (s-join "\n" (->> (-map (-partial 'ob-ipython--render file)
-                              (list (cdr (assoc :value result))
-                                    (cdr (assoc :display result))))
-                        (remove-if-not nil))))))
+      (s-concat
+       (format "# Out[%d]:\n" (cdr (assoc :exec-count ret)))
+       (s-join "\n" (->> (-map (-partial 'ob-ipython--render file)
+                               (list (cdr (assoc :value result))
+                                     (cdr (assoc :display result))))
+                         (remove-if-not nil)))))))
 
 (defun ob-ipython--render (file-or-nil values)
   (let ((org (lambda (value) value))
@@ -609,7 +657,11 @@ This function is called by `org-babel-execute-src-block'."
         (txt (lambda (value)
                (let ((lines (s-lines value)))
                  (if (cdr lines)
-                     (format "#+BEGIN_EXAMPLE\n%s\n#+END_EXAMPLE" (s-join "\n  " lines))
+                     (->> lines
+                          (-map 's-trim-right)
+                          (s-join "\n  ")
+                          (s-concat "  ")
+                          (format "#+BEGIN_EXAMPLE\n%s\n#+END_EXAMPLE"))
                    (s-concat ": " (car lines)))))))
     (or (-when-let (val (cdr (assoc 'text/org values))) (funcall org val))
         (-when-let (val (cdr (assoc 'image/png values))) (funcall png val))
