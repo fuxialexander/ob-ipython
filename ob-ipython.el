@@ -168,7 +168,9 @@ can be displayed.")
 (defun ob-ipython--get-python ()
   (locate-file (if (eq system-type 'windows-nt)
                    "python.exe"
-                 (or python-shell-interpreter "python"))
+                 "python"
+                 ;; (or python-shell-interpreter "python")
+                 )
                exec-path))
 
 (defun ob-ipython--create-kernel (name &optional kernel)
