@@ -3,7 +3,7 @@
 ;; Author: Greg Sexton <gregsexton@gmail.com>
 ;; Keywords: literate programming, reproducible research
 ;; Homepage: http://www.gregsexton.org
-;; Package-Requires: ((s "1.9.0") (dash "2.10.0") (dash-functional "1.2.0") (lpy "0.1.0") (f "0.17.2") (emacs "24"))
+;; Package-Requires: ((s "1.9.0") (dash "2.10.0") (dash-functional "1.2.0") (f "0.17.2") (emacs "24"))
 
 ;; The MIT License (MIT)
 
@@ -35,7 +35,6 @@
 
 (require 'ob)
 (require 'ob-python)
-(require 'lpy)
 (require 'dash)
 (require 'dash-functional)
 (require 's)
@@ -196,25 +195,54 @@ can be displayed.")
           procs)))
 
 (defun ob-ipython--create-repl (name &optional params)
-    (let ((cmd (s-join " " (ob-ipython--kernel-repl-cmd name))))
-      (if (string= "default" name)
-          (progn
-            (run-python cmd nil nil)
-            (format "*%s*" python-shell-buffer-name))
-        (if (string-match "^remote-.*ssh.json" name)
-            (when (not (ignore-errors (process-live-p (get-process (format "Python:ob-ipython-%s" name)))))
-              (let* ((remote (s-split "-" name))
-                     (remote-host (nth 1 remote))
-                     (remote-session (nth 3 remote)))
-                (ob-ipython-generate-local-path-from-remote remote-session remote-host params)))
-          (let* ((process-name (format "Python:ob-ipython-%s" name))
-                 (buf (python-shell-make-comint cmd process-name t))
-                 (proc (get-buffer-process process-name))
-                 (dir (cdr (assoc :pydir params))))
-            (if dir (with-current-buffer buf
-                      (setq-local default-directory dir)))
-            (sleep-for 1)
-            (format "*%s*" process-name))))))
+  "Create repl based on NAME and PARAMS.
+If PARAMS specifies remote kernel, copy the kernel config from remote server and
+create a repl connecting to remote session."
+  (let ((cmd (s-join
+              " "
+              (ob-ipython--kernel-repl-cmd
+               name))))
+    (if (string= "default" name)
+        (progn
+          (run-python cmd nil nil)
+          (format
+           "*%s*"
+           python-shell-buffer-name))
+      (if (string-match
+           "^remote-.*ssh.json"
+           name)
+          (when (not (ignore-errors
+                       (process-live-p
+                        (get-process
+                         (format
+                          "Python:ob-ipython-%s"
+                          name)))))
+            (let* ((remote (s-split "-" name))
+                   (remote-host (nth 1 remote))
+                   (remote-session (nth 3 remote)))
+              (+org/ob-ipython-generate-local-path-from-remote
+               remote-session
+               remote-host
+               params)))
+        (let* ((process-name (format
+                              "Python:ob-ipython-%s"
+                              name))
+               (python-shell-prompt-detect-enabled nil)
+               (python-shell-completion-native-enable nil)
+               (buf (python-shell-make-comint
+                     cmd
+                     process-name
+                     t))
+               (dir (cdr (assoc :pydir params))))
+          (if dir
+              (with-current-buffer
+                  buf
+                (setq-local
+                 default-directory
+                 dir)))
+          (sleep-for 1)
+          (format "*%s*" process-name))))))
+
 
 
 ;; kernel management
@@ -542,27 +570,41 @@ The elements of the list have the form (\"kernel\" \"language\")."
                kernelspecs))))
 
 (defun ob-ipython-generate-local-path-from-remote (session host params)
-  "Copy remote config to local, start a jupyter console to generate a new one."
-  (let* ((runtime-dir (substring (shell-command-to-string
-                                  (concat "ssh " host " jupyter --runtime-dir")) 0 -1))
+  "Given a remote SESSION with PARAMS and corresponding HOST, copy remote config to local, start a jupyter console to generate a new one."
+  (let* ((runtime-dir
+          (substring (shell-command-to-string (concat "ssh " host " jupyter --runtime-dir")) 0 -1))
          (runtime-file (concat runtime-dir "/" "kernel-" session ".json"))
          (tramp-path (concat "/ssh:" host ":" runtime-file))
-         (tramp-copy (concat jupyter-local-runtime-dir "/remote-" host "-kernel-" session ".json"))
-         (local-path (concat "Python:ob-ipython-" (file-name-sans-extension (file-name-nondirectory tramp-copy)) "-ssh.json")))
+         (tramp-copy (concat +ob-ipython-local-runtime-dir "/remote-" host "-kernel-" session ".json"))
+         (local-path
+          (concat
+           "Python:ob-ipython-"
+           (file-name-sans-extension (file-name-nondirectory tramp-copy))
+           "-ssh.json")))
     ;; scp remote file to local
     (copy-file tramp-path tramp-copy t)
     ;; connect to remote use new config
     (let* ((python-shell-interpreter-interactive-arg " console --simple-prompt")
+           (python-shell-prompt-detect-enabled nil)
            (python-shell-completion-native-enable nil)
            (buf (python-shell-make-comint
-                 (concat ob-ipython-command " console --simple-prompt --existing " tramp-copy " --ssh " host)
-                 (concat "" local-path) t))
+                 (concat
+                  ob-ipython-command
+                  " console --simple-prompt --existing "
+                  tramp-copy
+                  " --ssh "
+                  host)
+                 (concat "" local-path)
+                 t))
            (proc (get-buffer-process buf))
            (dir (cdr (assoc :pydir params))))
       (sleep-for 3)
-      (if dir (with-current-buffer buf
-                (setq-local default-directory dir)))
+      (if dir
+          (with-current-buffer
+              buf
+            (setq-local default-directory dir)))
       (format "*%s*" proc))))
+
 
 (defun ob-ipython--configure-kernel (kernel-lang)
   "Configure org mode to use specified kernel."
@@ -598,24 +640,55 @@ have previously been configured."
 (defvar org-babel-default-header-args:ipython '())
 
 (defun org-babel-edit-prep:ipython (info)
-  ;; TODO: based on kernel, should change the major mode
-  (ob-ipython--create-kernel (->> info (nth 2) (assoc :session) cdr
-                                  ob-ipython--normalize-session)
-                             (->> info (nth 2) (assoc :kernel) cdr))
+  (let* ((params (nth 2 info))
+         (session (cdr (assoc :session params))))
+    (org-babel-ipython-initiate-session
+     session
+     params))
   ;; Support for python.el's "send-code" commands within edit buffers.
-  (setq-local python-shell-buffer-name
-              (format "Python:ob-ipython-%s" (->> info (nth 2) (assoc :session) cdr
-                                                  ob-ipython--normalize-session)))
-  (setq lispy-python-proc (format "Python:ob-ipython-%s" (->> info (nth 2) (assoc :session) cdr
-                                                              ob-ipython--normalize-session)))
   (setq-local
-   default-directory (format "%s" (->> info (nth 2) (assoc :pydir) cdr
-                                       ob-ipython--normalize-session)))
+   python-shell-buffer-name
+   (format
+    "Python:ob-ipython-%s"
+    (->>
+     info
+     (nth 2)
+     (assoc :session)
+     cdr ob-ipython--normalize-session)))
+  (setq-local
+   default-directory
+   (format
+    "%s"
+    (->>
+     info
+     (nth 2)
+     (assoc :pydir)
+     cdr ob-ipython--normalize-session)))
   (ob-ipython-mode 1)
-  (setq lispy--python-middleware-loaded-p nil)
-  (setq-local company-idle-delay nil)
-  (setq company-backends '(company-capf company-dabbrev company-files company-yasnippet))
-  (lispy--python-middleware-load))
+  ;; hack on company mode to use company-capf rather than company-anaconda
+  (when (featurep 'company)
+    (setq-local
+     company-backends
+     '(company-capf
+       company-dabbrev
+       company-files
+       company-yasnippet))
+    (setq-local
+     company-idle-delay
+     nil))
+  (when (featurep 'lpy)
+    (setq lispy-python-proc
+          (format
+           "Python:ob-ipython-%s"
+           (->>
+            info
+            (nth 2)
+            (assoc :session)
+            cdr ob-ipython--normalize-session)))
+    (setq lispy--python-middleware-loaded-p
+          nil)
+    (lispy--python-middleware-load)))
+
 
 (defun ob-ipython--normalize-session (session)
   (if (string= "default" session)
@@ -631,15 +704,21 @@ have previously been configured."
          ob-ipython--normalize-session)))
 
 (defun org-babel-execute:ipython (body params)
-    "Execute a block of IPython code with Babel.
+  "Execute a BODY of IPython code with PARAMS in org-babel.
 This function is called by `org-babel-execute-src-block'."
-    (message default-directory)
-    (let ((session (cdr (assoc :session params))))
-      (org-babel-ipython-initiate-session session params))
-    (ob-ipython--clear-output-buffer)
-    (if (cdr (assoc :async params))
-        (ob-ipython--execute-async body params)
-      (ob-ipython--execute-sync body params)))
+  (message default-directory)
+  (let ((session (cdr (assoc :session params))))
+    (org-babel-ipython-initiate-session
+     session
+     params))
+  (ob-ipython--clear-output-buffer)
+  (if (cdr (assoc :async params))
+      (ob-ipython--execute-async
+       body
+       params)
+    (ob-ipython--execute-sync
+     body
+     params)))
 
 (defun ob-ipython--execute-async (body params)
   (let* ((file (cdr (assoc :ipyfile params)))
@@ -732,14 +811,20 @@ VARS contains resolved variable references"
   (error "Currently unsupported."))
 
 (defun org-babel-ipython-initiate-session (&optional session params)
-    "Create a session named SESSION according to PARAMS."
-    (if (string= session "none")
-        (error "ob-ipython currently only supports evaluation using a session.
+  "Create a session named SESSION according to PARAMS."
+  (if (string= session "none")
+      (error
+       "ob-ipython currently only supports evaluation using a session.
 Make sure your src block has a :session param.")
-      (when (not (s-ends-with-p ".json" session))
-        (ob-ipython--create-kernel (ob-ipython--normalize-session session)
-                                   (cdr (assoc :kernel params))))
-      (ob-ipython--create-repl (ob-ipython--normalize-session session) params)))
+    (when (not (s-ends-with-p ".json" session))
+      (ob-ipython--create-kernel
+       (ob-ipython--normalize-session
+        session)
+       (cdr (assoc :kernel params))))
+    (ob-ipython--create-repl
+     (ob-ipython--normalize-session
+      session)
+     params)))
 
 ;; async
 
